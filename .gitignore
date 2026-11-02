@@ -1,0 +1,31 @@
+# PlatformIO
+.pio
+.pioenvs
+.piolibdeps
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+build/
+managed_components/
+dependencies.lock
+
+# IDE & Editor files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Python cache (generate_model.py)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS generated files
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Thumbs.db
+[Dd]esktop.ini
