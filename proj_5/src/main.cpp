@@ -1,186 +1,119 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_lcd_panel_vendor.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <stdio.h>
-#include <string.h>
 
 
-// Định nghĩa các chân GPIO kết nối màn hình TFT
-#define PIN_NUM_MOSI 11 // SDA của màn hình
-#define PIN_NUM_CLK 12  // SCL của màn hình
-#define PIN_NUM_CS 10   // CS của màn hình
-#define PIN_NUM_DC 13   // DC của màn hình
-#define PIN_NUM_RST 14  // RES của màn hình
+#define LCD_HOST SPI2_HOST
+#define PIN_NUM_SCL GPIO_NUM_12
+#define PIN_NUM_SDA GPIO_NUM_11
+#define PIN_NUM_RES GPIO_NUM_14
+#define PIN_NUM_DC GPIO_NUM_13
+#define PIN_NUM_CS GPIO_NUM_10
+#define PIN_NUM_BLK GPIO_NUM_9
 
-#define LCD_WIDTH 132
-#define LCD_HEIGHT 162
+#define LCD_H_RES 240
+#define LCD_V_RES 240
+#define LINES_BATCH 40
 
-static spi_device_handle_t spi;
+static uint16_t *line_buf = NULL;
 
-// Gửi lệnh điều khiển xuống màn hình
-void lcd_send_cmd(const uint8_t cmd) {
-  spi_transaction_t t;
-  memset(&t, 0, sizeof(t));
-  t.length = 8;
-  t.tx_buffer = &cmd;
-  t.user = (void *)0; // DC = 0
-  gpio_set_level((gpio_num_t)PIN_NUM_DC, 0);
-  spi_device_transmit(spi, &t);
+void fill_screen_safe(esp_lcd_panel_handle_t panel_handle, uint16_t color) {
+  uint16_t swapped = (color >> 8) | (color << 8);
+  for (int i = 0; i < LCD_H_RES * LINES_BATCH; i++) {
+    line_buf[i] = swapped;
+  }
+  for (int y = 0; y < LCD_V_RES; y += LINES_BATCH) {
+    esp_lcd_panel_draw_bitmap(panel_handle, 0, y, LCD_H_RES, y + LINES_BATCH,
+                              line_buf);
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
 }
 
-// Gửi dữ liệu màu sắc xuống màn hình
-void lcd_send_data(const uint8_t *data, int len) {
-  if (len == 0)
-    return;
-  spi_transaction_t t;
-  memset(&t, 0, sizeof(t));
-  t.length = len * 8;
-  t.tx_buffer = data;
-  t.user = (void *)1; // DC = 1
-  gpio_set_level((gpio_num_t)PIN_NUM_DC, 1);
-  spi_device_transmit(spi, &t);
-}
+void test_with_config(int spi_mode, int cs_pin) {
+  printf("\n>>> ĐANG TEST: SPI_MODE = %d | CS_PIN = %d <<<\n", spi_mode,
+         cs_pin);
 
-// Khởi tạo Bus SPI
-void lcd_spi_init(void) {
-  gpio_config_t io_conf = {};
-  io_conf.pin_bit_mask = (1ULL << PIN_NUM_DC) | (1ULL << PIN_NUM_RST);
-  io_conf.mode = GPIO_MODE_OUTPUT;
-  io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-  io_conf.intr_type = GPIO_INTR_DISABLE;
-  gpio_config(&io_conf);
+  if (cs_pin == -1) {
+    gpio_set_direction(PIN_NUM_CS, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_NUM_CS, 0);
+  }
 
-  spi_bus_config_t buscfg;
-  memset(&buscfg, 0, sizeof(buscfg));
-  buscfg.mosi_io_num = PIN_NUM_MOSI;
-  buscfg.miso_io_num = -1;
-  buscfg.sclk_io_num = PIN_NUM_CLK;
-  buscfg.quadwp_io_num = -1;
-  buscfg.quadhd_io_num = -1;
-  buscfg.max_transfer_sz = LCD_WIDTH * LCD_HEIGHT * 2 + 10;
+  esp_lcd_panel_io_handle_t io_handle = NULL;
+  esp_lcd_panel_io_spi_config_t io_config = {};
+  io_config.dc_gpio_num = PIN_NUM_DC;
+  io_config.cs_gpio_num =
+      (gpio_num_t)cs_pin; // Ép kiểu tường minh tránh lỗi -fpermissive
+  io_config.pclk_hz = 10 * 1000 * 1000;
+  io_config.lcd_cmd_bits = 8;
+  io_config.lcd_param_bits = 8;
+  io_config.spi_mode = spi_mode;
+  io_config.trans_queue_depth = 10;
+  ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
+                                           &io_config, &io_handle));
 
-  spi_device_interface_config_t devcfg;
-  memset(&devcfg, 0, sizeof(devcfg));
-  devcfg.clock_speed_hz = 20 * 1000 * 1000; // 20MHz
-  devcfg.mode = 0;
-  devcfg.spics_io_num = PIN_NUM_CS;
-  devcfg.queue_size = 7;
+  esp_lcd_panel_handle_t panel_handle = NULL;
+  esp_lcd_panel_dev_config_t panel_config = {};
+  panel_config.reset_gpio_num = PIN_NUM_RES;
+  panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
+  panel_config.bits_per_pixel = 16;
+  ESP_ERROR_CHECK(
+      esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle));
 
-  ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
-  ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &spi));
-}
-
-// Khởi tạo chuỗi lệnh ST7789
-void lcd_init_sequence(void) {
-  gpio_set_level((gpio_num_t)PIN_NUM_RST, 0);
-  vTaskDelay(pdMS_TO_TICKS(100));
-  gpio_set_level((gpio_num_t)PIN_NUM_RST, 1);
-  vTaskDelay(pdMS_TO_TICKS(100));
-
-  lcd_send_cmd(0x01); // Software Reset
+  ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
   vTaskDelay(pdMS_TO_TICKS(150));
-
-  lcd_send_cmd(0x11); // Sleep Out
+  ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
   vTaskDelay(pdMS_TO_TICKS(150));
+  ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, true));
 
-  lcd_send_cmd(0x3A); // Pixel Format Set (RGB565)
-  uint8_t color_mode = 0x55;
-  lcd_send_data(&color_mode, 1);
+  // Đã sửa cú pháp gọi hàm bị cụt trước đó
+  ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
 
-  lcd_send_cmd(0x21); // Display Inversion On
-  lcd_send_cmd(0x29); // Display ON
-  vTaskDelay(pdMS_TO_TICKS(50));
-}
+  printf(" -> Vẽ màu ĐỎ (MODE %d)\n", spi_mode);
+  fill_screen_safe(panel_handle, 0xF800);
+  vTaskDelay(pdMS_TO_TICKS(1000));
 
-// Thiết lập vùng vẽ cửa sổ trên màn hình
-void lcd_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
-  lcd_send_cmd(0x2A);
-  uint8_t col_data[4] = {(uint8_t)(x0 >> 8), (uint8_t)(x0 & 0xFF),
-                         (uint8_t)(x1 >> 8), (uint8_t)(x1 & 0xFF)};
-  lcd_send_data(col_data, 4);
+  printf(" -> Vẽ màu XANH LÁ (MODE %d)\n", spi_mode);
+  fill_screen_safe(panel_handle, 0x07E0);
+  vTaskDelay(pdMS_TO_TICKS(1000));
 
-  lcd_send_cmd(0x2B);
-  uint8_t row_data[4] = {(uint8_t)(y0 >> 8), (uint8_t)(y0 & 0xFF),
-                         (uint8_t)(y1 >> 8), (uint8_t)(y1 & 0xFF)};
-  lcd_send_data(row_data, 4);
+  printf(" -> Vẽ màu XANH DƯƠNG (MODE %d)\n", spi_mode);
+  fill_screen_safe(panel_handle, 0x001F);
+  vTaskDelay(pdMS_TO_TICKS(1000));
 
-  lcd_send_cmd(0x2C); // Memory Write
-}
-
-// Tô toàn bộ màn hình một màu sắc bất kỳ
-void lcd_fill_screen(uint16_t color) {
-  lcd_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
-  uint8_t buffer[256];
-  for (int i = 0; i < sizeof(buffer); i += 2) {
-    buffer[i] = (color >> 8) & 0xFF;
-    buffer[i + 1] = color & 0xFF;
-  }
-  int total_pixels = LCD_WIDTH * LCD_HEIGHT;
-  for (int i = 0; i < total_pixels; i += sizeof(buffer) / 2) {
-    lcd_send_data(buffer, sizeof(buffer));
-  }
-}
-
-// Vẽ một khối chữ nhật nhỏ (dùng để dựng font chữ đơn giản)
-void lcd_draw_filled_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
-                          uint16_t color) {
-  if (x >= LCD_WIDTH || y >= LCD_HEIGHT)
-    return;
-  if (x + w > LCD_WIDTH)
-    w = LCD_WIDTH - x;
-  if (y + h > LCD_HEIGHT)
-    h = LCD_HEIGHT - y;
-
-  lcd_set_window(x, y, x + w - 1, y + h - 1);
-
-  uint8_t hb = (color >> 8) & 0xFF;
-  uint8_t lb = color & 0xFF;
-
-  // Gửi dữ liệu theo từng dòng để tối ưu bộ nhớ
-  uint8_t line_buf[w * 2];
-  for (int i = 0; i < w; i++) {
-    line_buf[i * 2] = hb;
-    line_buf[i * 2 + 1] = lb;
-  }
-
-  for (int j = 0; j < h; j++) {
-    lcd_send_data(line_buf, w * 2);
-  }
-}
-
-// Hàm vẽ một ký tự đơn giản dạng khối (Block Character Renderer)
-void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t color) {
-  // Tạo một số khối pixel đặc trưng để hiển thị chữ "ESP32-S3 OK"
-  lcd_draw_filled_rect(x, y, 10, 14, color);
+  esp_lcd_panel_del(panel_handle);
+  esp_lcd_panel_io_del(io_handle);
 }
 
 extern "C" void app_main(void) {
-  printf("\n========================================\n");
-  printf("=== TEST HIỂN THỊ MÀN HÌNH TFT SPI ===\n");
-  printf("========================================\n");
+  vTaskDelay(pdMS_TO_TICKS(1000));
 
-  lcd_spi_init();
-  lcd_init_sequence();
-  printf("Khởi tạo màn hình thành công!\n");
+  line_buf = (uint16_t *)heap_caps_malloc(
+      LCD_H_RES * LINES_BATCH * sizeof(uint16_t), MALLOC_CAP_DMA);
+
+  gpio_set_direction(PIN_NUM_BLK, GPIO_MODE_OUTPUT);
+  printf("Kiểm tra đèn nền BLK (GPIO 9): Tắt 0.5s -> Bật...\n");
+  gpio_set_level(PIN_NUM_BLK, 0);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  gpio_set_level(PIN_NUM_BLK, 1);
+
+  spi_bus_config_t buscfg = {};
+  buscfg.sclk_io_num = PIN_NUM_SCL;
+  buscfg.mosi_io_num = PIN_NUM_SDA;
+  buscfg.miso_io_num = -1;
+  buscfg.quadwp_io_num = -1;
+  buscfg.quadhd_io_num = -1;
+  buscfg.max_transfer_sz = LCD_H_RES * LINES_BATCH * sizeof(uint16_t);
+  ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
   while (1) {
-    // 1. Xóa nền màn hình thành màu Đen
-    lcd_fill_screen(0x0000);
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    // 2. Vẽ các khối chữ nhật giả lập dòng chữ kiểm tra (Màu Trắng và Vàng)
-    lcd_draw_filled_rect(20, 40, 92, 20,
-                         0xF800); // Khối màu Đỏ (Báo hiệu hệ thống chạy)
-    lcd_draw_filled_rect(20, 70, 92, 20, 0x07E0);  // Khối màu Xanh lá
-    lcd_draw_filled_rect(20, 100, 92, 20, 0x001F); // Khối màu Xanh dương
-
-    vTaskDelay(pdMS_TO_TICKS(1500));
-
-    // 3. Đổi nền sang màu Trắng để kiểm tra tương phản
-    lcd_fill_screen(0xFFFF);
-    vTaskDelay(pdMS_TO_TICKS(1500));
+    test_with_config(0, PIN_NUM_CS);
+    test_with_config(3, -1);
+    test_with_config(2, -1);
   }
 }
